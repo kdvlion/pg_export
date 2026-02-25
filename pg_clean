@@ -1,0 +1,187 @@
+#!/bin/bash
+
+# Скрипт для удаления файлов старше N дней
+# Использование: ./pg_clean <путь> <количество_дней> [опции]
+
+set -euo pipefail
+
+# Функция для вывода справки
+show_help() {
+    echo "Использование: $0 <путь> <количество_дней> [опции]"
+    echo ""
+    echo "Опции:"
+    echo "  -h, --help              Показать эту справку"
+    echo "  -d, --dry-run           Только показать, что будет удалено (без удаления)"
+    echo "  -r, --recursive         Рекурсивная очистка поддиректорий"
+    echo "  -p, --pattern PATTERN   Паттерн поиска файлов (например, '*.log')"
+    echo "  -v, --verbose           Подробный вывод"
+    echo "  -t, --type TYPE         Тип файлов: f (regular), d (directory), l (symlink)"
+    echo ""
+    echo "Примеры:"
+    echo "  $0 /var/log 30 -r -p '*.log'"
+    echo "  $0 /tmp 7 -d -v"
+    echo "  $0 /backup 90 -r -t f"
+}
+
+# Проверка количества аргументов
+if [ $# -lt 2 ]; then
+    echo "Ошибка: Недостаточно аргументов" >&2
+    show_help
+    exit 1
+fi
+
+# Парсинг аргументов
+TARGET_DIR="$1"
+DAYS="$2"
+shift 2
+
+# Параметры по умолчанию
+DRY_RUN=false
+RECURSIVE=false
+PATTERN="*"
+VERBOSE=false
+FILE_TYPE="f"
+
+# Парсинг опций
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            VERBOSE=true  # В dry-run всегда показываем подробности
+            shift
+            ;;
+        -r|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
+        -p|--pattern)
+            PATTERN="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -t|--type)
+            FILE_TYPE="$2"
+            shift 2
+            ;;
+        *)
+            echo "Ошибка: Неизвестная опция '$1'" >&2
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Валидация аргументов
+if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+    echo "Ошибка: Количество дней должно быть числом" >&2
+    exit 1
+fi
+
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Ошибка: Директория '$TARGET_DIR' не существует или не является директорией" >&2
+    exit 1
+fi
+
+if ! [[ "$FILE_TYPE" =~ ^[fdl]$ ]]; then
+    echo "Ошибка: Неверный тип файла. Допустимые значения: f, d, l" >&2
+    exit 1
+fi
+
+# Функция для форматирования времени
+format_days() {
+    local days=$1
+    if [ $days -eq 1 ]; then
+        echo "1 день"
+    elif [ $days -ge 2 ] && [ $days -le 4 ]; then
+        echo "$days дня"
+    elif [ $days -ge 5 ] && [ $days -le 20 ]; then
+        echo "$days дней"
+    else
+        case $(($days % 10)) in
+            1) echo "$days день" ;;
+            2|3|4) echo "$days дня" ;;
+            *) echo "$days дней" ;;
+        esac
+    fi
+}
+
+# Определение команды find в зависимости от рекурсивности
+if [ "$RECURSIVE" = true ]; then
+    FIND_CMD="find \"$TARGET_DIR\" -type $FILE_TYPE -name \"$PATTERN\""
+else
+    FIND_CMD="find \"$TARGET_DIR\" -maxdepth 1 -type $FILE_TYPE -name \"$PATTERN\""
+fi
+
+# Получение списка файлов для удаления
+FILES_TO_DELETE=$(eval $FIND_CMD -mtime +$((DAYS-1)) 2>/dev/null || true)
+FILE_COUNT=$(echo "$FILES_TO_DELETE" | grep -c '^' || true)
+
+if [ "$FILE_COUNT" -eq 0 ]; then
+    echo "Файлы старше $(format_days $DAYS) не найдены в '$TARGET_DIR'"
+    exit 0
+fi
+
+# Вывод информации
+echo "=== Очистка старых файлов ==="
+echo "Директория:     $TARGET_DIR"
+echo "Старше:         $(format_days $DAYS)"
+echo "Паттерн:        $PATTERN"
+echo "Тип файлов:     $FILE_TYPE"
+echo "Режим:          $([ "$DRY_RUN" = true ] && echo "ТЕСТОВЫЙ (без удаления)" || echo "РЕАЛЬНЫЙ")"
+echo "Найдено файлов: $FILE_COUNT"
+
+if [ "$VERBOSE" = true ] && [ -n "$FILES_TO_DELETE" ]; then
+    echo ""
+    echo "Список файлов для удаления:"
+    echo "$FILES_TO_DELETE" | while IFS= read -r file; do
+        if [ -e "$file" ]; then
+            file_info=$(stat --format="%y | %s байт" "$file" 2>/dev/null || echo "не удалось получить информацию")
+            echo "  - $file ($file_info)"
+        fi
+    done
+fi
+
+echo ""
+if [ "$DRY_RUN" = true ]; then
+    echo "Режим тестирования: файлы НЕ будут удалены"
+    exit 0
+fi
+
+# Подтверждение удаления
+#read -p "Вы уверены, что хотите удалить эти $FILE_COUNT файлов? [y/N]: " -n 1 -r
+#echo ""
+#if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+#    echo "Отменено пользователем"
+#    exit 0
+#fi
+
+# Удаление файлов
+DELETED_COUNT=0
+ERROR_COUNT=0
+
+echo "$FILES_TO_DELETE" | while IFS= read -r file; do
+    if [ -e "$file" ]; then
+        if rm -f "$file" 2>/dev/null; then
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+            [ "$VERBOSE" = true ] && echo "✓ Удалён: $file"
+        else
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            echo "✗ Ошибка удаления: $file" >&2
+        fi
+    fi
+done
+
+echo ""
+echo "=== Результат ==="
+echo "Успешно удалено: $DELETED_COUNT из $FILE_COUNT"
+if [ "$ERROR_COUNT" -gt 0 ]; then
+    echo "С ошибками:     $ERROR_COUNT"
+    exit 1
+fi

@@ -1,0 +1,599 @@
+#!/bin/bash
+VERSION="1.0.1"
+
+#TODO
+#Если таблица в своём название содержит "-" или другой символ необрабатываемый, то таблицу экспорт пропустит - пока не исправлено
+
+
+# Параметры по умолчанию
+DB_HOST="localhost"
+DB_PORT="5432"
+DB_NAME=""
+DB_USER="postgres"
+EXPORT_BASE_DIR="./exports"
+COMPRESS=true
+VERBOSE=false
+INCLUDE_SCHEMA=true
+BATCH_SIZE=0  # 0 - экспортировать все сразу #Если рамер таблицы больше этого, то раблица будет сохраняться в несолько файлов разбитых на части указанного размера
+
+# Функция для вывода справки
+show_help() {
+    cat << EOF
+Скрипт для экспорта таблиц PostgreSQL в бинарном формате
+
+Использование: $(basename "$0") [ПАРАМЕТРЫ]
+
+Параметры:
+  -h, --host HOST          Хост PostgreSQL (по умолчанию: $DB_HOST)
+  -p, --port PORT          Порт PostgreSQL (по умолчанию: $DB_PORT)
+  -d, --dbname NAME        Имя базы данных (обязательный параметр)
+  -u, --username USER      Имя пользователя (по умолчанию: $DB_USER)
+  -o, --output DIR         Базовая директория для экспорта (по умолчанию: $EXPORT_BASE_DIR)
+  -c, --compress           Сжимать результат (по умолчанию: включено)
+  -n, --no-compress        Не сжимать результат
+  -s, --no-schema          Не экспортировать схему
+  -v, --verbose            Подробный вывод
+  -b, --batch-size N       Размер файлов на которые будут разбиваться таблицы объмом больше казанного (0 - не разбивать начасти)
+  --help                   Показать эту справку
+
+Примеры:
+  $(basename "$0") -d mydb -h db.example.com
+  $(basename "$0") -d mydb -u admin -o /backups -n -v
+  $(basename "$0") --dbname production --host 192.168.1.100 --port 5433
+
+Примечание:
+  Для аутентификации используйте файл ~/.pgpass или переменную окружения PGPASSWORD
+EOF
+    exit 0
+}
+
+# Разбор параметров командной строки
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--host)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Ошибка: параметр $1 требует значение" >&2
+                    exit 1
+                fi
+                DB_HOST="$2"
+                shift 2
+                ;;
+            -p|--port)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Ошибка: параметр $1 требует значение" >&2
+                    exit 1
+                fi
+                DB_PORT="$2"
+                shift 2
+                ;;
+            -d|--dbname)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Ошибка: параметр $1 требует значение" >&2
+                    exit 1
+                fi
+                DB_NAME="$2"
+                shift 2
+                ;;
+            -u|--username)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Ошибка: параметр $1 требует значение" >&2
+                    exit 1
+                fi
+                DB_USER="$2"
+                shift 2
+                ;;
+            -o|--output)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Ошибка: параметр $1 требует значение" >&2
+                    exit 1
+                fi
+                EXPORT_BASE_DIR="$2"
+                shift 2
+                ;;
+            -c|--compress)
+                COMPRESS=true
+                shift
+                ;;
+            -n|--no-compress)
+                COMPRESS=false
+                shift
+                ;;
+            -s|--no-schema)
+                INCLUDE_SCHEMA=false
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -b|--batch-size)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Ошибка: параметр $1 требует значение" >&2
+                    exit 1
+                fi
+                if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    echo "Ошибка: размер пакета должен быть числом" >&2
+                    exit 1
+                fi
+                BATCH_SIZE="$2"
+                shift 2
+                ;;
+            --help)
+                show_help
+                ;;
+            -*)
+                echo "Ошибка: неизвестный параметр $1" >&2
+                echo "Используйте --help для просмотра справки" >&2
+                exit 1
+                ;;
+            *)
+                echo "Ошибка: неожиданный аргумент $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Проверка обязательных параметров
+    if [[ -z "$DB_NAME" ]]; then
+        echo "Ошибка: не указано имя базы данных" >&2
+        echo "Используйте -d или --dbname для указания имени базы" >&2
+        exit 1
+    fi
+}
+
+# Функции для вывода
+log_info() {
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_error() {
+    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
+}
+
+log_debug() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    fi
+}
+
+# Функция для проверки подключения к базе данных
+check_database_connection() {
+    log_info "Проверка подключения к базе данных..."
+    
+    if ! command -v psql &> /dev/null; then
+        log_error "Команда psql не найдена. Убедитесь, что PostgreSQL клиент установлен"
+        return 1
+    fi
+    
+    # Пробуем подключиться к базе данных
+    if ! PGPASSWORD="$PGPASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" > /dev/null 2>&1; then
+        log_error "Не удалось подключиться к базе данных:"
+        log_error "  Хост: $DB_HOST"
+        log_error "  Порт: $DB_PORT"
+        log_error "  База: $DB_NAME"
+        log_error "  Пользователь: $DB_USER"
+        log_error ""
+        log_error "Возможные решения:"
+        log_error "1. Проверьте правильность параметров подключения"
+        log_error "2. Убедитесь, что база данных существует и доступна"
+        log_error "3. Настройте аутентификацию через ~/.pgpass или переменную PGPASSWORD"
+        log_error "4. Проверьте настройки доступа в pg_hba.conf"
+        return 1
+    fi
+    
+    log_info "Подключение к базе данных успешно установлено"
+    return 0
+}
+
+# Функция для получения списка таблиц
+get_tables_list() {
+    local tables_query="
+        SELECT schemaname || '.' || tablename 
+        FROM pg_tables 
+        WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY schemaname, tablename;
+    "
+
+#    local tables_query="
+#        SELECT tablename 
+#        FROM pg_tables 
+#        WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+#        ORDER BY schemaname, tablename;
+#    "
+    
+    PGPASSWORD="$PGPASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+        -t -c "$tables_query" 2>/dev/null | grep -v '^$' | xargs
+}
+
+# Функция для экспорта схемы
+export_schema() {
+    local schema_file="$1"
+    
+    log_info "Экспорт схемы базы данных..."
+    
+    if ! PGPASSWORD="$PGPASSWORD" pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+        -s --no-privileges --no-owner > "$schema_file" 2>> "$LOG_FILE"; then
+        log_error "Не удалось экспортировать схему базы данных"
+        return 1
+    fi
+    
+    log_info "Схема экспортирована: $schema_file"
+    return 0
+}
+
+# Функция для экспорта одной таблицы
+export_table() {
+    local table="$1"
+    local export_dir="$2"
+    local index="$3"
+    
+    # Генерируем имя файла
+    #local filename=$(echo "$table" | sed 's/\-/_/g')
+    local filename=$(echo "$table" | sed 's/[^.a-zA-Z0-9]/_/g')
+    local binary_file="$export_dir/${filename}.bin"
+    local text_file="$export_dir/${filename}.table.txt"
+    
+    log_debug "Экспорт таблицы: $table -> $binary_file"
+    
+    # Получаем количество строк
+    local count_query="SELECT COUNT(*) FROM $table;"
+    local row_count=$(PGPASSWORD="$PGPASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+        -t -c "$count_query" 2>/dev/null | tr -d ' ' | grep -v '^$' || echo "0")
+    
+    local start_time=$(date +%s.%N)
+    
+    # Экспортируем таблицу в бинарном формате
+    if [[ "$BATCH_SIZE" -gt 0 ]] && [[ "$row_count" -gt "$BATCH_SIZE" ]]; then
+        # Пакетный экспорт для больших таблиц
+        export_table_in_batches "$table" "$binary_file" "$row_count"
+    else
+        # Экспорт всей таблицы
+        local copy_query="COPY "$table" TO STDOUT WITH (FORMAT BINARY);"
+        
+        if ! PGPASSWORD="$PGPASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+            -c "$copy_query" > "$binary_file" 2>> "$LOG_FILE"; then
+            log_error "Ошибка при экспорте таблицы $table"
+            rm -f "$binary_file"
+            return 1
+        fi
+    fi
+    
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc)
+    
+    local file_size=0
+    if [[ -f "$binary_file" ]]; then
+        file_size=$(stat -c%s "$binary_file" 2>/dev/null || echo "0")
+    fi
+    
+    # Добавляем информацию в массив метаданных
+    METADATA_JSON+="$(printf ',\n    {
+        "table": "%s",
+        "filename": "%s.bin",
+        "row_count": %d,
+        "file_size": %d,
+        "duration": %.2f,
+        "timestamp": "%s"
+    }' "$table" "$filename" "$row_count" "$file_size" "$duration" "$(date -Iseconds)")"
+    
+    #Создаём файл описателя для каждой 
+    cat > "$text_file" << EOF
+table
+$table
+filename
+$filename.bin
+row_count
+$row_count
+file_size
+$file_size
+duration
+$duration
+timestamp
+$(date -Iseconds)
+EOF
+
+    return 0
+}
+
+# Функция для пакетного экспорта больших таблиц
+export_table_in_batches() {
+    local table="$1"
+    local output_file="$2"
+    local total_rows="$3"
+    
+    log_debug "Пакетный экспорт таблицы $table ($total_rows строк, размер пакета: $BATCH_SIZE)"
+    
+    local offset=0
+    local batch_num=1
+    
+    # Очищаем файл перед записью
+    > "$output_file"
+    
+    while [[ $offset -lt $total_rows ]]; do
+        local batch_query="COPY (SELECT * FROM $table ORDER BY 1 OFFSET $offset LIMIT $BATCH_SIZE) TO STDOUT WITH (FORMAT BINARY);"
+        
+        log_debug "  Пакет $batch_num: OFFSET $offset, LIMIT $BATCH_SIZE"
+        
+        if ! PGPASSWORD="$PGPASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+            -c "$batch_query" >> "$output_file" 2>> "$LOG_FILE"; then
+            log_error "Ошибка при экспорте пакета $batch_num таблицы $table"
+            return 1
+        fi
+        
+        offset=$((offset + BATCH_SIZE))
+        batch_num=$((batch_num + 1))
+    done
+    
+    return 0
+}
+
+# Основная функция экспорта
+main_export() {
+    parse_arguments "$@"
+    
+    # Проверяем подключение к базе данных
+    if ! check_database_connection; then
+        exit 1
+    fi
+    
+    # Создаем директорию для экспорта
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local export_dir="$EXPORT_BASE_DIR/${DB_NAME}_${timestamp}"
+    local metadata_file="$export_dir/metadata.json"
+    local schema_file="$export_dir/schema.sql"
+    LOG_FILE="$export_dir/export.log"
+    
+    mkdir -p "$export_dir"
+    if [[ $? -ne 0 ]]; then
+        log_error "Не удалось создать директорию для экспорта: $export_dir"
+        exit 1
+    fi
+    
+    log_info "Директория для экспорта: $export_dir"
+    
+    # Начинаем логирование в файл
+    exec 3>&1 4>&2
+    if [[ "$VERBOSE" == true ]]; then
+        exec > >(tee -a "$LOG_FILE") 2>&1
+    else
+        exec > >(tee -a "$LOG_FILE" > /dev/null) 2>&1
+    fi
+    
+    log_info "Начало экспорта базы данных: $DB_NAME"
+    log_info "Параметры подключения:"
+    log_info "  Хост: $DB_HOST"
+    log_info "  Порт: $DB_PORT"
+    log_info "  Пользователь: $DB_USER"
+    log_info "  Директория: $export_dir"
+    log_info "  Сжатие: $COMPRESS"
+    log_info "  Размер пакета на который будут разбиваться таблицы: $([ "$BATCH_SIZE" -eq 0 ] && echo "нет" || echo "$BATCH_SIZE")"
+    
+    # Экспортируем схему если нужно
+    if [[ "$INCLUDE_SCHEMA" == true ]]; then
+        export_schema "$schema_file"
+    fi
+    
+    # Получаем список таблиц
+    log_info "Получение списка таблиц..."
+    local tables=$(get_tables_list)
+    
+    if [[ -z "$tables" ]]; then
+        log_error "В базе данных нет таблиц для экспорта или не удалось получить список"
+        exit 1
+    fi
+    
+    # Преобразуем строку в массив
+    local table_array=($tables)
+    local total_tables=${#table_array[@]}
+    
+    log_info "Найдено таблиц для экспорта: $total_tables"
+    
+    # Инициализируем массив метаданных
+    METADATA_JSON="["
+    local first_entry=true
+    
+    # Экспортируем каждую таблицу
+    local success_count=0
+    local fail_count=0
+    
+    for ((i=0; i<total_tables; i++)); do
+        local table="${table_array[$i]}"
+        
+        # Показываем прогресс
+        local progress=$(( (i * 100) / total_tables ))
+        printf "\rЭкспорт таблиц: [%-50s] %d%% (%d/%d)" \
+            "$(printf '#%.0s' $(seq 1 $((progress/2))))" \
+            "$progress" "$((i+1))" "$total_tables"
+        
+        # Экспортируем таблицу
+        if export_table "$table" "$export_dir" "$i"; then
+            success_count=$((success_count + 1))
+        else
+            fail_count=$((fail_count + 1))
+        fi
+    done
+    
+    # Завершаем прогресс-бар
+    printf "\rЭкспорт таблиц: [%-50s] 100%% (%d/%d)\n" \
+        "$(printf '#%.0s' $(seq 1 50))" \
+        "$total_tables" "$total_tables"
+    
+    # Завершаем JSON метаданных
+    METADATA_JSON+="\n]"
+    echo -e "$METADATA_JSON" > "$metadata_file"
+    
+    # Восстанавливаем стандартный вывод
+    exec 1>&3 2>&4
+    
+    # Создаем скрипт для импорта
+    create_import_script "$export_dir"
+    
+    # Создаем README файл
+    create_readme_file "$export_dir" "$success_count" "$fail_count" "$total_tables"
+    
+    # Сжимаем если нужно
+    local archive_path=""
+    if [[ "$COMPRESS" == true ]]; then
+        log_info "Создание архива..."
+        archive_path="${export_dir}.tar.gz"
+        if tar -czf "$archive_path" -C "$(dirname "$export_dir")" "$(basename "$export_dir")" 2>/dev/null; then
+            local archive_size=$(du -h "$archive_path" | cut -f1)
+            log_info "Архив создан: $archive_path ($archive_size)"
+            
+            # Предлагаем удалить исходную директорию
+            #read -p "Удалить исходную директорию $export_dir? [y/N]: " -n 1 -r
+            #echo
+            #if [[ $REPLY =~ ^[Yy]$ ]]; then
+                rm -rf "$export_dir"
+                log_info "Исходная директория удалена"
+            #fi
+        else
+            log_error "Не удалось создать архив"
+        fi
+    fi
+    
+    # Итоговая статистика
+    log_info "========================================="
+    log_info "Экспорт завершен!"
+    log_info "Успешно: $success_count, Неудачно: $fail_count, Всего: $total_tables"
+    log_info "Директория с данными: $export_dir"
+    if [[ -n "$archive_path" ]]; then
+        log_info "Архив: $archive_path"
+    fi
+    log_info "Лог экспорта: $LOG_FILE"
+    log_info "========================================="
+    
+    # Показываем путь для импорта
+    if [[ "$COMPRESS" == true ]] && [[ -f "$archive_path" ]]; then
+        echo ""
+        echo "Для импорта выполните:"
+        echo "  tar -xzf $(basename "$archive_path")"
+        echo "  cd $(basename "$export_dir")"
+        echo "  ./import.sh"
+    else
+        echo ""
+        echo "Для импорта выполните:"
+        echo "  cd $export_dir"
+        echo "  ./import.sh"
+    fi
+}
+
+# Функция для создания скрипта импорта
+create_import_script() {
+    local export_dir="$1"
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+    # Проверяем существование файла
+    if [ -f "$SCRIPT_DIR"/pg_import ]; then
+	# Копируем файл
+	cp "$SCRIPT_DIR"/pg_import "$export_dir"
+	echo "Файл успешно скопирован в $export_dir/"
+    else
+	echo "Ошибка: файл $SCRIPT_DIR/pg_import не найден"
+    fi
+
+    chmod +x "$export_dir/pg_import"
+
+    log_info "Создан скрипт импорта: $export_dir/pg_import"
+}
+
+# Функция для создания README файла
+create_readme_file() {
+    local export_dir="$1"
+    local success_count="$2"
+    local fail_count="$3"
+    local total_tables="$4"
+
+    cat > "$export_dir/version.md" << VERSION_EOF
+$VERSION
+VERSION_EOF
+
+
+    cat > "$export_dir/README.md" << README_EOF
+# Экспорт базы данных: $DB_NAME
+Version: $VERSION
+
+## Информация об экспорте
+- **Дата экспорта:** $(date)
+- **База данных:** $DB_NAME
+- **Хост:** $DB_HOST
+- **Порт:** $DB_PORT
+- **Пользователь:** $DB_USER
+- **Успешно экспортировано:** $success_count из $total_tables таблиц
+- **Неудачно:** $fail_count таблиц
+
+## Содержимое экспорта
+1. **\`*.bin\`** - бинарные файлы данных таблиц
+2. **\`*.txt\`** - имя файлы данных таблиц и соотвествие его названию таблицы
+3. **\`metadata.json\`** - метаданные экспорта (список таблиц, количество строк, размеры файлов)
+4. **\`schema.sql\`** - DDL схема базы данных (если включена)
+5. **\`import.sh\`** - скрипт для импорта данных
+6. **\`export.log\`** - лог процесса экспорта
+7. **\`README.md\`** - эта документация
+
+## Восстановление данных
+
+### Способ 1: Автоматический импорт (рекомендуется)
+
+\`\`\`bash
+# Перейдите в директорию экспорта
+cd $export_dir
+
+# Настройте параметры подключения (если отличаются от экспорта)
+export IMPORT_DB_HOST="localhost"
+export IMPORT_DB_PORT="5432"
+export IMPORT_DB_NAME="имя_базы"
+export IMPORT_DB_USER="пользователь"
+export PGPASSWORD="пароль"
+
+# Запустите скрипт импорта
+./pg_import.sh
+\`\`\`
+
+Или передайте параметры напрямую:
+\`\`\`bash
+./pg_import.sh -h localhost -p 5432 -d mydb -u postgres
+\`\`\`
+
+### Способ 2: Ручной импорт
+
+1. Создайте базу данных (если не существует):
+\`\`\`bash
+createdb -h localhost -p 5432 -U postgres mydb
+\`\`\`
+
+2. Восстановите схему (если файл существует):
+\`\`\`bash
+psql -h localhost -p 5432 -U postgres -d mydb -f schema.sql
+\`\`\`
+
+3. Импортируйте данные для каждой таблицы:
+\`\`\`bash
+psql -h localhost -p 5432 -U postgres -d mydb \\
+  -c "COPY schema.table FROM STDIN WITH (FORMAT BINARY);" < schema_table.bin
+\`\`\`
+
+## Примечания
+- **Бинарный формат** сохраняет точное представление данных
+- **Совместимость:** бинарный формат зависит от версии PostgreSQL
+- **Рекомендуется** использовать одинаковые версии для экспорта и импорта
+- **Требования для импорта:** 
+  - PostgreSQL клиент (\`psql\`)
+  - Утилита \`jq\` для парсинга JSON
+
+## Параметры экспорта
+- Размер пакета: $([ "$BATCH_SIZE" -eq 0 ] && echo "не использовался" || echo "$BATCH_SIZE строк")
+- Сжатие архива: $([ "$COMPRESS" == "true" ] && echo "включено" || echo "выключено")
+- Схема: $([ "$INCLUDE_SCHEMA" == "true" ] && echo "включена" || echo "не включена")
+
+## Контакты
+Экспорт создан автоматически. При возникновении проблем проверьте файл \`export.log\`.
+README_EOF
+}
+
+# Обработка сигналов
+trap 'echo -e "\nЭкспорт прерван"; exit 1' INT TERM
+
+# Запуск основной функции
+main_export "$@"
